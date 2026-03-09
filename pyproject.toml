@@ -1,0 +1,8 @@
+[project]
+name = "mcp-wacli"
+version = "0.1.0"
+description = "MCP server wrapper for wacli (WhatsApp CLI)"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.6.0",
+]

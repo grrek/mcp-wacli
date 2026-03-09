@@ -53,7 +53,9 @@ mcp-wacli is a thin Python MCP server that wraps the [wacli](https://github.com/
 5. **JSON stdout** from wacli is captured and returned as MCP tool result
 6. **AI client** receives the response and incorporates it into the conversation
 
-### 1.3 Transport: SSH as MCP transport
+### 1.3 Transport modes
+
+#### stdio (default) — SSH or local
 
 MCP uses stdio (stdin/stdout) as its default transport. When the server runs on a remote machine, SSH acts as a transparent pipe:
 
@@ -62,16 +64,51 @@ Client stdin  →  SSH  →  Remote server.py stdin
 Client stdout ←  SSH  ←  Remote server.py stdout
 ```
 
-This is configured in the MCP client settings:
+No ports, no HTTP, no API keys — SSH handles authentication and encryption.
 
-```json
-{
-  "command": "ssh",
-  "args": ["hostname", "PATH=$HOME/.local/bin:$PATH cd ~/mcp-wacli && uv run server.py"]
-}
+#### HTTP/SSE — network access with Bearer auth
+
+When started with `--http`, the server runs an HTTP server with SSE (Server-Sent Events) transport:
+
+```
+Client  ──HTTP POST──▶  server.py:9800/messages
+Client  ◀──SSE stream──  server.py:9800/sse
 ```
 
-No ports, no HTTP, no API keys — SSH handles authentication and encryption.
+**Authentication:** Every HTTP request must include `Authorization: Bearer <token>`. The token is auto-generated on first run and saved to `~/.mcp-wacli-token` (chmod 600).
+
+**Security model:**
+- Token is a 32-character `secrets.token_urlsafe()` — 192 bits of entropy
+- Token file is readable only by the owner (mode 0600)
+- Requests without a valid token receive HTTP 401
+- Bind to Tailscale IP (`MCP_HOST=100.x.x.x`) to restrict network access
+
+**Configuration:**
+
+| Env variable | Default | Description |
+|---|---|---|
+| `MCP_HOST` | `0.0.0.0` | Bind address |
+| `MCP_PORT` | `9800` | Listen port |
+
+**Running as a systemd service:**
+
+```ini
+[Unit]
+Description=mcp-wacli HTTP/SSE server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/mcp-wacli
+ExecStart=/home/user/.local/bin/uv run server.py --http
+Environment=MCP_HOST=0.0.0.0
+Environment=MCP_PORT=9800
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
 
 ## 2. File structure
 

@@ -5,18 +5,27 @@ Exposes wacli commands as MCP tools so any MCP-compatible LLM client
 (Claude Code, Claude Desktop, Cursor, etc.) can interact with WhatsApp
 through a locally authenticated wacli session.
 
-Repository: https://github.com/user/mcp-wacli
+Supports two transport modes:
+  - stdio (default): for SSH or local use
+  - SSE/HTTP (--http): for network access with Bearer token auth
+
+Repository: https://github.com/grrek/mcp-wacli
 Upstream:   https://github.com/steipete/wacli
 """
 
 import json
+import os
+import secrets
 import subprocess
+import sys
+from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 WACLI_BIN = "wacli"
 WACLI_TIMEOUT = 30  # seconds per command
+TOKEN_FILE = Path.home() / ".mcp-wacli-token"
 
 mcp = FastMCP("whatsapp-wacli")
 
@@ -458,8 +467,62 @@ def auth_status() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Auth middleware for HTTP/SSE mode
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_or_create_token() -> str:
+    """Read token from ~/.mcp-wacli-token, or generate one if missing."""
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    token = secrets.token_urlsafe(32)
+    TOKEN_FILE.write_text(token + "\n")
+    TOKEN_FILE.chmod(0o600)
+    return token
+
+
+def _make_auth_middleware(token: str):
+    """Create ASGI middleware that validates Bearer token on every request."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    class BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {token}":
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                )
+            return await call_next(request)
+
+    return BearerAuthMiddleware
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
+def main():
+    if "--http" in sys.argv:
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "9800"))
+        token = _get_or_create_token()
+
+        # Inject auth middleware into the SSE app
+        app = mcp.sse_app()
+        middleware_cls = _make_auth_middleware(token)
+        app.add_middleware(middleware_cls)
+
+        print(f"MCP-WACLI HTTP/SSE server starting on {host}:{port}", file=sys.stderr)
+        print(f"Token file: {TOKEN_FILE}", file=sys.stderr)
+        print(f"Connect with: Authorization: Bearer {token}", file=sys.stderr)
+
+        import uvicorn
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+    else:
+        mcp.run()
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()

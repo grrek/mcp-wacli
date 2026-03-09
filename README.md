@@ -13,20 +13,30 @@ Instead of reimplementing the WhatsApp Web protocol, mcp-wacli delegates everyth
 
 ## Architecture
 
+Two transport modes are supported:
+
 ```
-AI Client (Claude Code / Desktop / Cursor)
-  │  MCP protocol (stdin/stdout over SSH)
-  ▼
-server.py (Python — FastMCP)
-  │  subprocess calls
-  ▼
-wacli --json (Go binary, locally installed)
-  │  whatsmeow protocol
-  ▼
-WhatsApp Web Multi-Device API
-  │
-  ▼
-Your WhatsApp account
+                 ┌─────────────────────────────────┐
+                 │  AI Client                       │
+                 │  Claude / Cursor / GPT / Gemini  │
+                 └──────┬────────────┬──────────────┘
+                        │            │
+              SSH+stdio │            │ HTTP/SSE
+                        ▼            ▼
+                 ┌──────────────────────────┐
+                 │  server.py (FastMCP)      │
+                 │  27 tools                 │
+                 │  Bearer token auth (HTTP) │
+                 └──────────┬───────────────┘
+                            │ subprocess
+                            ▼
+                 ┌──────────────────────┐
+                 │  wacli --json        │
+                 │  (Go / whatsmeow)    │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                    WhatsApp servers
 ```
 
 All data stays local. Messages are only sent to the AI when it explicitly invokes a tool.
@@ -43,7 +53,7 @@ All data stays local. Messages are only sent to the AI when it explicitly invoke
 
 ```bash
 # 1. Clone
-git clone https://github.com/user/mcp-wacli.git
+git clone https://github.com/grrek/mcp-wacli.git
 cd mcp-wacli
 
 # 2. Install dependencies
@@ -52,13 +62,37 @@ uv sync
 # 3. Verify wacli is authenticated
 wacli doctor --json
 
-# 4. Test the MCP server
+# 4. Test the MCP server (stdio mode)
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | uv run server.py
 ```
 
+## Transport modes
+
+### Mode 1: stdio (over SSH) — default
+
+Best for Claude Code and Claude Desktop when accessing a remote server.
+
+```bash
+uv run server.py
+```
+
+### Mode 2: HTTP/SSE with Bearer token auth
+
+Best for network access from any MCP client, including non-Anthropic LLMs.
+
+```bash
+uv run server.py --http
+```
+
+On first run, a random 32-character token is generated and saved to `~/.mcp-wacli-token`. The server prints the token to stderr on startup. All HTTP requests must include `Authorization: Bearer <token>`.
+
+Customize with environment variables:
+- `MCP_HOST` — bind address (default: `0.0.0.0`)
+- `MCP_PORT` — port (default: `9800`)
+
 ## Configure your AI client
 
-### Claude Code (global — all projects)
+### Claude Code — SSH (global)
 
 Edit `~/.claude/settings.json`:
 
@@ -69,18 +103,32 @@ Edit `~/.claude/settings.json`:
       "command": "ssh",
       "args": [
         "your-server",
-        "PATH=$HOME/.local/bin:$PATH cd ~/mcp-wacli && uv run server.py"
+        "export PATH=$HOME/.local/bin:$PATH && cd ~/mcp-wacli && uv run server.py"
       ]
     }
   }
 }
 ```
 
-### Claude Code (project-only)
+### Claude Code — HTTP/SSE
 
-Edit `.claude/settings.json` in your project root with the same structure.
+Edit `~/.claude/settings.json`:
 
-### Claude Desktop
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "type": "sse",
+      "url": "http://your-server:9800/sse",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop — SSH
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
@@ -91,14 +139,30 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
       "command": "ssh",
       "args": [
         "your-server",
-        "PATH=$HOME/.local/bin:$PATH cd ~/mcp-wacli && uv run server.py"
+        "export PATH=$HOME/.local/bin:$PATH && cd ~/mcp-wacli && uv run server.py"
       ]
     }
   }
 }
 ```
 
-### Local (no SSH)
+### Claude Desktop — HTTP/SSE
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "type": "sse",
+      "url": "http://your-server:9800/sse",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+### Local (no SSH, no HTTP)
 
 If wacli and mcp-wacli are on the same machine:
 
@@ -113,6 +177,15 @@ If wacli and mcp-wacli are on the same machine:
   }
 }
 ```
+
+### Any MCP-compatible client (GPT, Gemini, etc.)
+
+Start the HTTP server on thera-claw:
+```bash
+uv run server.py --http
+```
+
+Then point the client to `http://your-server:9800/sse` with the Bearer token from `~/.mcp-wacli-token`.
 
 ## Available tools (27)
 

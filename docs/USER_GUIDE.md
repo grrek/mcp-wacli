@@ -143,6 +143,47 @@ The WhatsApp data on the server comes from `wacli sync`. For the most recent mes
 - **No cloud storage**: Nothing is uploaded to third-party services
 - **Send confirmation**: The AI should always confirm before sending messages
 - **Your session**: Uses the same WhatsApp session as your existing wacli setup
+- **Bearer token**: HTTP mode requires a 192-bit token for every request. The token is stored locally with owner-only permissions
+- **Network isolation**: Recommended to run behind a VPN (e.g. Tailscale) rather than on the public internet
+
+## Connection modes
+
+### HTTP/SSE (recommended)
+
+The MCP server runs as a persistent service on your server. Your AI client connects over the network with a Bearer token. Best for:
+- Always-on access without SSH
+- Connecting from multiple AI clients
+- Non-Anthropic LLMs (GPT, Gemini, etc.)
+
+### SSH (stdio)
+
+Claude Code opens an SSH connection and runs the MCP server on-demand. Best for:
+- Simple setup (no systemd, no tokens)
+- Single-user access with existing SSH keys
+
+### Local (stdio)
+
+If wacli and mcp-wacli are on the same machine, they communicate directly via stdio. Best for:
+- Development and testing
+- Local-only setups
+
+## Server management (HTTP mode)
+
+If the MCP server runs as a systemd service:
+
+```bash
+# Check if the server is running
+ssh your-server "systemctl --user status mcp-wacli"
+
+# View recent logs
+ssh your-server "journalctl --user -u mcp-wacli --since '1 hour ago'"
+
+# Restart after updates
+ssh your-server "systemctl --user restart mcp-wacli"
+
+# Read the Bearer token
+ssh your-server "cat ~/.mcp-wacli-token"
+```
 
 ## Session expiration
 
@@ -185,6 +226,19 @@ Some operations take longer (sync, media download). The server has generous time
 If you're not running `wacli sync` in the background, messages in the local DB may be old. Either:
 - Start a background sync: `wacli sync --follow` on the server
 - Or ask the AI to sync: *"Sync my WhatsApp messages"*
+
+### MCP not connecting (HTTP mode)
+
+1. Verify the server is running: `systemctl --user status mcp-wacli`
+2. Test connectivity: `curl -H "Authorization: Bearer YOUR_TOKEN" http://YOUR_SERVER:9800/sse`
+3. Check the token matches: compare `~/.mcp-wacli-token` on the server with your client config
+4. Ensure VPN (Tailscale) is connected if the server is behind one
+
+### MCP not connecting (SSH mode)
+
+1. Test SSH manually: `ssh your-server "echo ok"`
+2. Check for stderr noise: `ssh -o LogLevel=ERROR -o ClearAllForwardings=yes your-server "echo ok" 2>&1`
+3. Verify uv is in PATH: `ssh your-server "export PATH=\$HOME/.local/bin:\$PATH && which uv"`
 
 ## Limitations
 

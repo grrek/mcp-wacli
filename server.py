@@ -22,12 +22,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 WACLI_BIN = "wacli"
 WACLI_TIMEOUT = 30  # seconds per command
 TOKEN_FILE = Path.home() / ".mcp-wacli-token"
 
-mcp = FastMCP("whatsapp-wacli")
+# Disable DNS rebinding protection — we use Bearer token auth for HTTP mode
+# and stdio mode doesn't need it.
+mcp = FastMCP(
+    "whatsapp-wacli",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -509,17 +515,27 @@ def main():
         port = int(os.environ.get("MCP_PORT", "9800"))
         token = _get_or_create_token()
 
-        # Inject auth middleware into the SSE app
-        app = mcp.sse_app()
-        middleware_cls = _make_auth_middleware(token)
-        app.add_middleware(middleware_cls)
+        inner_app = mcp.sse_app()
+
+        # ASGI wrapper: validate Bearer token before passing to MCP app
+        async def auth_wrapper(scope, receive, send):
+            if scope["type"] == "http":
+                headers = dict(scope.get("headers", []))
+                auth = headers.get(b"authorization", b"").decode()
+                if auth != f"Bearer {token}":
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [[b"content-type", b"application/json"]]})
+                    await send({"type": "http.response.body",
+                                "body": b'{"error":"Unauthorized"}'})
+                    return
+            await inner_app(scope, receive, send)
 
         print(f"MCP-WACLI HTTP/SSE server starting on {host}:{port}", file=sys.stderr)
         print(f"Token file: {TOKEN_FILE}", file=sys.stderr)
         print(f"Connect with: Authorization: Bearer {token}", file=sys.stderr)
 
         import uvicorn
-        uvicorn.run(app, host=host, port=port, log_level="warning")
+        uvicorn.run(auth_wrapper, host=host, port=port, log_level="warning")
     else:
         mcp.run()
 

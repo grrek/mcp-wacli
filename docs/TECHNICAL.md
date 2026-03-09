@@ -15,11 +15,11 @@ mcp-wacli is a thin Python MCP server that wraps the [wacli](https://github.com/
 │  │  Claude Desktop / │                                  │
 │  │  Cursor / Cline   │                                  │
 │  └────────┬──────────┘                                  │
-│           │ MCP protocol (JSON-RPC 2.0 over stdin/stdout)│
-│           │ transported via SSH                          │
+│           │ MCP protocol (JSON-RPC 2.0)                 │
+│           │ via SSH stdio or HTTP/SSE                   │
 └───────────┼─────────────────────────────────────────────┘
             │
-            ▼ SSH
+            ▼ SSH or HTTP (Tailscale / VPN)
 ┌─────────────────────────────────────────────────────────┐
 │  Server Machine (e.g. Linux headless)                   │
 │                                                         │
@@ -46,7 +46,7 @@ mcp-wacli is a thin Python MCP server that wraps the [wacli](https://github.com/
 
 ### 1.2 Data flow
 
-1. **AI client** sends a JSON-RPC `tools/call` message over stdin (via SSH)
+1. **AI client** sends a JSON-RPC `tools/call` message (via SSH stdio or HTTP POST)
 2. **server.py** receives it, maps the tool name to a wacli command
 3. **subprocess** runs `wacli --json <subcommand> [flags]`
 4. **wacli** reads from local SQLite DB or connects to WhatsApp (for live operations)
@@ -66,6 +66,16 @@ Client stdout ←  SSH  ←  Remote server.py stdout
 
 No ports, no HTTP, no API keys — SSH handles authentication and encryption.
 
+**SSH caveats for MCP:**
+
+The MCP protocol uses stdin/stdout as a clean JSON-RPC channel. Any unexpected output on stderr or stdout breaks the handshake. Common issues:
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| SSH warnings on stderr | `LocalForward` entries in `~/.ssh/config` produce `bind: Address already in use` | Add `-o ClearAllForwardings=yes` to SSH args |
+| SSH banners/motd | Server sends welcome messages | Add `-o LogLevel=ERROR` to suppress |
+| PATH not found for uv | `PATH=... cmd` only applies to that single command | Use `export PATH=... && cmd` |
+
 #### HTTP/SSE — network access with Bearer auth
 
 When started with `--http`, the server runs an HTTP server with SSE (Server-Sent Events) transport:
@@ -75,13 +85,55 @@ Client  ──HTTP POST──▶  server.py:9800/messages
 Client  ◀──SSE stream──  server.py:9800/sse
 ```
 
-**Authentication:** Every HTTP request must include `Authorization: Bearer <token>`. The token is auto-generated on first run and saved to `~/.mcp-wacli-token` (chmod 600).
+**Authentication architecture:**
 
-**Security model:**
-- Token is a 32-character `secrets.token_urlsafe()` — 192 bits of entropy
-- Token file is readable only by the owner (mode 0600)
-- Requests without a valid token receive HTTP 401
-- Bind to Tailscale IP (`MCP_HOST=100.x.x.x`) to restrict network access
+The HTTP mode uses a layered ASGI approach:
+
+```
+Incoming HTTP request
+    │
+    ▼
+auth_wrapper (ASGI)          ← Validates Bearer token (401 if invalid)
+    │
+    ▼
+mcp.sse_app() (Starlette)   ← FastMCP's built-in SSE handler
+    │
+    ▼
+MCP tool handler             ← Executes wacli subprocess
+```
+
+The `auth_wrapper` is a raw ASGI callable that wraps the FastMCP SSE app. It checks the `Authorization` header before any request reaches the MCP handler. This approach was chosen over Starlette middleware because:
+
+1. It runs before all Starlette middleware (including error handlers)
+2. It avoids conflicts with FastMCP's internal middleware stack
+3. It's simpler and has zero dependencies beyond ASGI
+
+**DNS rebinding protection:**
+
+The MCP library (>= 1.6) includes `TransportSecurityMiddleware` in `mcp.server.transport_security` that validates `Host` headers against a whitelist. By default, FastMCP auto-enables this for localhost binds with:
+
+```python
+allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"]
+```
+
+This causes `421 Invalid Host header` errors when connecting via IP (e.g. `100.108.42.3`). mcp-wacli disables this protection at the FastMCP constructor level:
+
+```python
+mcp = FastMCP(
+    "whatsapp-wacli",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
+```
+
+Security is instead enforced by:
+- Bearer token authentication (192-bit entropy, validated per-request)
+- Network-level access control (Tailscale VPN or similar)
+
+**Token management:**
+- Generated on first run via `secrets.token_urlsafe(32)` — 192 bits of entropy
+- Stored in `~/.mcp-wacli-token` with mode 0600 (owner-only read)
+- Printed to stderr on startup for easy copy
+- Persists across restarts (same token until manually deleted)
 
 **Configuration:**
 
@@ -90,7 +142,9 @@ Client  ◀──SSE stream──  server.py:9800/sse
 | `MCP_HOST` | `0.0.0.0` | Bind address |
 | `MCP_PORT` | `9800` | Listen port |
 
-**Running as a systemd service:**
+#### Running HTTP mode as a systemd user service
+
+This is the recommended deployment for HTTP mode. The service runs as a user unit (no root required), auto-restarts on failure, and survives SSH disconnects.
 
 ```ini
 [Unit]
@@ -99,8 +153,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/user/mcp-wacli
-ExecStart=/home/user/.local/bin/uv run server.py --http
+WorkingDirectory=/home/USER/mcp-wacli
+ExecStart=/home/USER/.local/bin/uv run server.py --http
 Environment=MCP_HOST=0.0.0.0
 Environment=MCP_PORT=9800
 Restart=on-failure
@@ -110,13 +164,29 @@ RestartSec=10
 WantedBy=default.target
 ```
 
+**Important:** Run `loginctl enable-linger USER` to allow the service to persist after logout. This command may require sudo if the user doesn't have linger enabled by default.
+
+Service management (all as the service user, no sudo):
+
+```bash
+systemctl --user daemon-reload          # Reload after editing .service file
+systemctl --user enable mcp-wacli       # Auto-start on boot
+systemctl --user start mcp-wacli        # Start now
+systemctl --user stop mcp-wacli         # Stop
+systemctl --user restart mcp-wacli      # Restart (e.g. after deploying new server.py)
+systemctl --user status mcp-wacli       # Check status
+journalctl --user -u mcp-wacli -f       # Follow logs
+journalctl --user -u mcp-wacli --since "1 hour ago"  # Recent logs
+```
+
 ## 2. File structure
 
 ```
 mcp-wacli/
-├── server.py           # MCP server — all tool definitions
+├── server.py           # MCP server — all tool definitions + HTTP auth
 ├── pyproject.toml      # Python project metadata & dependencies
 ├── .python-version     # Python version pin (3.11)
+├── .gitignore          # Git ignore rules
 ├── README.md           # User-facing documentation
 └── docs/
     ├── TECHNICAL.md    # This file
@@ -177,6 +247,38 @@ Error sources:
 - **wacli error**: wacli's own error JSON is passed through
 - **Missing binary**: `FileNotFoundError` — caught by generic exception handler
 
+### 3.4 HTTP/SSE authentication flow
+
+```
+                   ┌─────────────────────┐
+                   │  HTTP Request        │
+                   │  GET /sse            │
+                   │  Authorization:      │
+                   │  Bearer <token>      │
+                   └──────────┬──────────┘
+                              │
+                              ▼
+                   ┌─────────────────────┐
+                   │  auth_wrapper       │
+                   │  (raw ASGI)         │
+                   │                     │
+                   │  Check scope type   │
+                   │  == "http"?         │
+                   └──────┬──────────────┘
+                          │
+                    ┌─────┴─────┐
+                    │           │
+               Token valid  Token invalid
+                    │           │
+                    ▼           ▼
+             ┌──────────┐  ┌──────────┐
+             │ inner_app │  │ 401 JSON │
+             │ (FastMCP) │  │ response │
+             └──────────┘  └──────────┘
+```
+
+The wrapper also passes through non-HTTP scopes (like `lifespan`) directly to the inner app without auth checks, which is required for ASGI server startup.
+
 ## 4. wacli internals (relevant for maintainers)
 
 ### 4.1 Storage layout
@@ -231,25 +333,35 @@ Check status with `wacli doctor --json` → `data.fts_enabled`.
 
 ## 5. Deployment patterns
 
-### 5.1 Remote headless server (recommended)
+### 5.1 Remote headless server — HTTP/SSE with systemd (recommended)
+
+```
+Mac (Claude Code) ──HTTP/SSE──▶ Linux server (systemd: mcp-wacli + wacli)
+                    (Tailscale)
+```
+
+**Pros:** Always on, persistent service, auto-restart, no SSH session needed, works with any MCP client
+**Cons:** Requires VPN (Tailscale) or firewall for security, initial QR scan needs terminal access
+
+### 5.2 Remote headless server — SSH
 
 ```
 Mac (Claude Code) ──SSH──▶ Linux server (wacli + mcp-wacli)
 ```
 
-**Pros:** Always on, shared across devices, single WhatsApp session
-**Cons:** Requires SSH access, initial QR scan needs terminal access
+**Pros:** No extra ports, SSH handles auth and encryption
+**Cons:** SSH config must be clean (no stderr noise), Claude Code starts/stops server per session
 
-### 5.2 Local (same machine)
+### 5.3 Local (same machine)
 
 ```
 Mac (Claude Code) ──stdio──▶ Local (wacli + mcp-wacli)
 ```
 
-**Pros:** Simplest setup, no SSH
+**Pros:** Simplest setup, no SSH, no HTTP
 **Cons:** Must have wacli and Go installed locally
 
-### 5.3 Docker (future)
+### 5.4 Docker (future)
 
 Not yet implemented. Would require mounting `~/.wacli/` as a volume for session persistence.
 
@@ -327,6 +439,16 @@ go install github.com/steipete/wacli@latest
 wacli doctor --json
 ```
 
+### 7.4 Upgrading server.py on a remote server
+
+```bash
+# From your local machine
+scp server.py your-server:~/mcp-wacli/server.py
+
+# Then restart the service (if using systemd)
+ssh your-server "systemctl --user restart mcp-wacli"
+```
+
 ## 8. Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -337,3 +459,8 @@ wacli doctor --json
 | `exit code 1` with no output | wacli binary not found or crashed | Verify `which wacli` and check stderr |
 | SSH connection refused | Server down or SSH misconfigured | Check SSH config and server uptime |
 | `Client Outdated (405)` | WhatsApp rejected protocol version | Update wacli to latest version |
+| `421 Invalid Host header` | MCP DNS rebinding protection rejecting non-localhost IPs | Ensure `TransportSecuritySettings(enable_dns_rebinding_protection=False)` is set in FastMCP constructor |
+| `401 Unauthorized` (HTTP mode) | Missing or wrong Bearer token | Check `~/.mcp-wacli-token` on server; verify `Authorization` header |
+| SSH `bind: Address already in use` | `LocalForward` in `~/.ssh/config` | Add `-o ClearAllForwardings=yes` to SSH args |
+| MCP not loading in Claude Code | stderr noise from SSH | Add `-o LogLevel=ERROR` to SSH args |
+| systemd service stops after SSH logout | User linger not enabled | Run `loginctl enable-linger USERNAME` |

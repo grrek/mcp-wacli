@@ -9,7 +9,7 @@ Instead of reimplementing the WhatsApp Web protocol, mcp-wacli delegates everyth
 - **Zero duplicate sessions** — uses the same authenticated session as your existing wacli install
 - **Zero data duplication** — one SQLite DB, shared with wacli
 - **Full feature parity** — any wacli command becomes an MCP tool
-- **Tiny codebase** — ~300 lines of Python glue
+- **Tiny codebase** — ~540 lines of Python glue
 
 ## Architecture
 
@@ -70,7 +70,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 ### Mode 1: stdio (over SSH) — default
 
-Best for Claude Code and Claude Desktop when accessing a remote server.
+Best for Claude Code and Claude Desktop when accessing a remote server via SSH.
 
 ```bash
 uv run server.py
@@ -78,48 +78,107 @@ uv run server.py
 
 ### Mode 2: HTTP/SSE with Bearer token auth
 
-Best for network access from any MCP client, including non-Anthropic LLMs.
+Best for network access from any MCP client, including non-Anthropic LLMs. Can run as a persistent systemd service.
 
 ```bash
 uv run server.py --http
 ```
 
-On first run, a random 32-character token is generated and saved to `~/.mcp-wacli-token`. The server prints the token to stderr on startup. All HTTP requests must include `Authorization: Bearer <token>`.
+On first run, a random 32-character token is generated and saved to `~/.mcp-wacli-token` (mode 0600). The server prints the token to stderr on startup. All HTTP requests must include `Authorization: Bearer <token>`.
 
 Customize with environment variables:
 - `MCP_HOST` — bind address (default: `0.0.0.0`)
 - `MCP_PORT` — port (default: `9800`)
 
-## Configure your AI client
+**Note:** The MCP library's built-in DNS rebinding protection (`TrustedHostMiddleware`) is disabled in mcp-wacli because it rejects connections from non-localhost IPs. Authentication is handled instead by the ASGI Bearer token middleware, which validates every request at the transport level before it reaches the MCP handler.
 
-### Claude Code — SSH (global)
+#### Running as a systemd user service (recommended for HTTP mode)
 
-Edit `~/.claude/settings.json`:
+```bash
+mkdir -p ~/.config/systemd/user
 
-```json
-{
-  "mcpServers": {
-    "whatsapp": {
-      "command": "ssh",
-      "args": [
-        "your-server",
-        "export PATH=$HOME/.local/bin:$PATH && cd ~/mcp-wacli && uv run server.py"
-      ]
-    }
-  }
-}
+cat > ~/.config/systemd/user/mcp-wacli.service << 'EOF'
+[Unit]
+Description=mcp-wacli HTTP/SSE server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOUR_USER/mcp-wacli
+ExecStart=/home/YOUR_USER/.local/bin/uv run server.py --http
+Environment=MCP_HOST=0.0.0.0
+Environment=MCP_PORT=9800
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable mcp-wacli
+systemctl --user start mcp-wacli
+
+# Allow service to run without an active SSH session
+loginctl enable-linger YOUR_USER
 ```
 
-### Claude Code — HTTP/SSE
+Useful commands:
+- `systemctl --user status mcp-wacli` — check status
+- `systemctl --user restart mcp-wacli` — restart after updates
+- `journalctl --user -u mcp-wacli -f` — follow logs
 
-Edit `~/.claude/settings.json`:
+## Configure your AI client
+
+### Claude Code — HTTP/SSE (recommended)
+
+Use the Claude CLI to add the MCP server:
+
+```bash
+claude mcp add --transport sse -s user whatsapp http://YOUR_SERVER:9800/sse \
+  --header "Authorization: Bearer YOUR_TOKEN_HERE"
+```
+
+This writes the config to `~/.claude.json`. Alternatively, add it manually:
 
 ```json
 {
   "mcpServers": {
     "whatsapp": {
       "type": "sse",
-      "url": "http://your-server:9800/sse",
+      "url": "http://YOUR_SERVER:9800/sse",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+### Claude Code — SSH (stdio)
+
+```bash
+claude mcp add -s user whatsapp -- ssh \
+  -o LogLevel=ERROR \
+  -o ClearAllForwardings=yes \
+  your-server \
+  "export PATH=\$HOME/.local/bin:\$PATH && cd ~/mcp-wacli && uv run server.py"
+```
+
+> **Important SSH caveats:**
+> - Use `-o LogLevel=ERROR` to suppress SSH warnings on stderr (they break the MCP JSON-RPC handshake)
+> - Use `-o ClearAllForwardings=yes` if your `~/.ssh/config` has `LocalForward` entries for this host (port-forward bind warnings also break the handshake)
+
+### Claude Desktop — HTTP/SSE
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "type": "sse",
+      "url": "http://YOUR_SERVER:9800/sse",
       "headers": {
         "Authorization": "Bearer YOUR_TOKEN_HERE"
       }
@@ -130,33 +189,17 @@ Edit `~/.claude/settings.json`:
 
 ### Claude Desktop — SSH
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
-
 ```json
 {
   "mcpServers": {
     "whatsapp": {
       "command": "ssh",
       "args": [
+        "-o", "LogLevel=ERROR",
+        "-o", "ClearAllForwardings=yes",
         "your-server",
         "export PATH=$HOME/.local/bin:$PATH && cd ~/mcp-wacli && uv run server.py"
       ]
-    }
-  }
-}
-```
-
-### Claude Desktop — HTTP/SSE
-
-```json
-{
-  "mcpServers": {
-    "whatsapp": {
-      "type": "sse",
-      "url": "http://your-server:9800/sse",
-      "headers": {
-        "Authorization": "Bearer YOUR_TOKEN_HERE"
-      }
     }
   }
 }
@@ -180,12 +223,7 @@ If wacli and mcp-wacli are on the same machine:
 
 ### Any MCP-compatible client (GPT, Gemini, etc.)
 
-Start the HTTP server on thera-claw:
-```bash
-uv run server.py --http
-```
-
-Then point the client to `http://your-server:9800/sse` with the Bearer token from `~/.mcp-wacli-token`.
+Start the HTTP server and point the client to `http://YOUR_SERVER:9800/sse` with the Bearer token from `~/.mcp-wacli-token`.
 
 ## Available tools (27)
 
@@ -281,6 +319,8 @@ Once configured, you can ask your AI client things like:
 - Data is only sent to the AI model when a tool is explicitly invoked
 - No data leaves the machine except through WhatsApp's own protocol and MCP tool calls
 - The `send_message` and `send_file` tools require the AI client to request permission before execution
+- HTTP mode uses a 192-bit Bearer token (`secrets.token_urlsafe(32)`) stored with mode 0600
+- Recommended: restrict HTTP access to a VPN (e.g. Tailscale) rather than exposing to the public internet
 - wacli uses the unofficial WhatsApp Web API — use at your own risk
 
 ## Known limitations

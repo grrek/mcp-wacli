@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/grrek-mcp-wacli-badge.png)](https://mseep.ai/app/grrek-mcp-wacli)
+
 # mcp-wacli
 
 MCP (Model Context Protocol) server that wraps [wacli](https://github.com/steipete/wacli) — a WhatsApp CLI built on [whatsmeow](https://github.com/tulir/whatsmeow). Lets any MCP-compatible AI client (Claude Code, Claude Desktop, Cursor, Cline, etc.) read, search, and send WhatsApp messages through your personal account.
